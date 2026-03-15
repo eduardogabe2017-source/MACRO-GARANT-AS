@@ -80,10 +80,17 @@ def main():
              Longitud != 16 → Y='SIN', Z='SIN', AA='SIN DETALLE'
              No encontrado  → Y='NU',  Z='NU',  AA='NO UBICADO'
              Encontrado     → Z=moneda, Y=monto soles, AA='VALIDO'
-    PASO 4 - Mapeo de saldos en col AC (solo filas AB='Pendiente'):
-             Alguna fila NU  → 'OBSERVADO'
-             Todas numericas → |suma Y - col O| <= 1.5 → 'APLICAR' sino 'DIFERENCIA'
-             Filas SIN       → no reciben valor en AC
+    PASO 4 - 1er orden: agrupar por TRX (col L), solo filas AB='Pendiente'
+             Alguna fila NU            → AC='OBSERVADO'
+             Todas numericas ±1.5      → AC='APLICAR'
+             Fuera de rango            → AC='DIFERENCIA'
+             Filas SIN                 → no reciben valor en AC
+    PASO 5 - 2do orden: filas sin 'APLICAR' en AC, agrupar por CONCATENADO EY (col X)
+             Monto Y unico (no sumar duplicados) vs suma col O de TRX del grupo
+             Alguna fila NU            → AC='OBSERVADO'
+             Dentro de rango ±1.5      → AC='APLICAR 2'
+             Fuera de rango            → AC='DIFERENCIA'
+             Filas SIN                 → no se procesan
     """
     try:
         wb = xw.Book.caller()
@@ -99,7 +106,7 @@ def main():
     sh_rgc = wb.sheets["RGC"]
     sh_cxc = wb.sheets["CXC"]
 
-    # Leer RG col F desde fila 4
+    # ── Leer RG col F desde fila 4 ───────────────────────────
     last_rg_F = _last_row(sh_rg, "F", start=4)
     if last_rg_F < 4:
         raise RuntimeError("No se encontró data en RG (col F).")
@@ -113,7 +120,7 @@ def main():
     if not rg_trx_set:
         raise RuntimeError("No se encontraron TRX en RG col F.")
 
-    # Leer RGC desde fila 4
+    # ── Leer RGC desde fila 4 ────────────────────────────────
     last_rgc = _last_row(sh_rgc, "L", start=4)
     if last_rgc < 4:
         raise RuntimeError("No se encontró data en RGC (col L).")
@@ -125,10 +132,10 @@ def main():
     rgc_D = _pad(_read_col(sh_rgc, "D", 4, last_rgc), n_rows)
     rgc_O = _pad(_read_col(sh_rgc, "O", 4, last_rgc), n_rows)
 
-    # Limpiar columnas X a AC desde fila 4
+    # ── Limpiar columnas X a AC desde fila 4 ─────────────────
     sh_rgc.range(f"X4:AC{last_rgc}").clear_contents()
 
-    # Leer CXC col F, H, I desde fila 3
+    # ── Leer CXC col F, H, I desde fila 3 ────────────────────
     last_cxc_F = _last_row(sh_cxc, "F", start=3)
     cxc_dict = {}
     if last_cxc_F >= 3:
@@ -141,24 +148,27 @@ def main():
             if ref_n:
                 cxc_dict[ref_n] = (_norm_str(mon), monto)
 
-    # PASOS 1, 2 y 3
-    col_Y_results = []
-    col_AB_results = []
+    # ── PASOS 1, 2 y 3: procesar fila por fila ───────────────
+    col_X_results  = []   # concatenado EY
+    col_Y_results  = []   # monto soles o SIN/NU
+    col_AB_results = []   # Pendiente o ""
+    col_AC_results = [""] * n_rows  # se llenará en pasos 4 y 5
 
     for i in range(n_rows):
         row_excel = i + 4
 
-        # PASO 1: cruce RG vs RGC
+        # PASO 1: cruce RG vs RGC → col AB
         trx = _norm_trx(rgc_L[i])
         ab_val = "Pendiente" if (trx and trx in rg_trx_set) else ""
         sh_rgc.range(f"AB{row_excel}").value = ab_val
         col_AB_results.append(ab_val)
 
-        # PASO 2: concatenado EY
+        # PASO 2: concatenado EY → col X
         concat = _build_concatenado(rgc_Q[i], rgc_R[i])
         sh_rgc.range(f"X{row_excel}").value = concat
+        col_X_results.append(concat)
 
-        # PASO 3: cruce con CXC
+        # PASO 3: cruce con CXC → cols Y, Z, AA
         if len(concat) != 16:
             sh_rgc.range(f"Y{row_excel}").value = "SIN"
             sh_rgc.range(f"Z{row_excel}").value = "SIN"
@@ -198,7 +208,7 @@ def main():
             sh_rgc.range(f"Y{row_excel}").value = monto_soles
             col_Y_results.append(monto_soles)
 
-    # PASO 4: mapeo de saldos en col AC
+    # ── PASO 4: 1er orden — agrupar por TRX ──────────────────
     trx_groups = defaultdict(list)
     for i in range(n_rows):
         if col_AB_results[i] == "Pendiente":
@@ -207,7 +217,7 @@ def main():
                 trx_groups[trx].append(i)
 
     for trx, indices in trx_groups.items():
-        y_vals = [col_Y_results[i] for i in indices]
+        y_vals  = [col_Y_results[i] for i in indices]
         has_nu  = any(v == "NU"  for v in y_vals)
         has_sin = any(v == "SIN" for v in y_vals)
 
@@ -234,6 +244,65 @@ def main():
                     ac_val = "APLICAR" if abs(suma_y - monto_o_float) <= 1.5 else "DIFERENCIA"
 
         for i in indices:
+            col_AC_results[i] = ac_val
+            sh_rgc.range(f"AC{i + 4}").value = ac_val
+
+    # ── PASO 5: 2do orden — agrupar por CONCATENADO EY ───────
+    # Solo filas que NO tienen 'APLICAR' en AC y no son SIN
+    concat_groups = defaultdict(list)
+    for i in range(n_rows):
+        if col_AC_results[i] == "APLICAR":
+            continue
+        if col_Y_results[i] == "SIN":
+            continue
+        concat = col_X_results[i]
+        if concat and len(concat) == 16:
+            concat_groups[concat].append(i)
+
+    # Solo procesar concatenados que aparecen en más de una fila (duplicados)
+    for concat, indices in concat_groups.items():
+        if len(indices) < 2:
+            continue
+
+        y_vals = [col_Y_results[i] for i in indices]
+        has_nu = any(v == "NU" for v in y_vals)
+
+        if has_nu:
+            ac_val = "OBSERVADO"
+        else:
+            # Monto Y único (el comprobante es uno solo en CXC)
+            cxc_key = concat.upper()
+            if cxc_key not in cxc_dict:
+                continue
+            moneda, monto_cxc = cxc_dict[cxc_key]
+            if monto_cxc is None:
+                continue
+
+            # Convertir monto Y a soles si es necesario (ya está convertido en col_Y_results)
+            # Usar el primer valor numérico de col_Y_results como monto único
+            monto_y_unico = None
+            for v in y_vals:
+                if isinstance(v, (int, float)):
+                    monto_y_unico = float(v)
+                    break
+
+            if monto_y_unico is None:
+                continue
+
+            # Sumar col O de todos los TRX del grupo
+            suma_o = 0.0
+            for i in indices:
+                monto_o = rgc_O[i]
+                try:
+                    if monto_o is not None:
+                        suma_o += float(monto_o)
+                except (ValueError, TypeError):
+                    pass
+
+            ac_val = "APLICAR 2" if abs(monto_y_unico - suma_o) <= 1.5 else "DIFERENCIA"
+
+        for i in indices:
+            col_AC_results[i] = ac_val
             sh_rgc.range(f"AC{i + 4}").value = ac_val
 
     wb.save()
