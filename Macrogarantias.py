@@ -251,6 +251,8 @@ def main():
     # Solo filas que NO tienen 'APLICAR' en AC y no son SIN
     concat_groups = defaultdict(list)
     for i in range(n_rows):
+        if col_AB_results[i] != "Pendiente":
+            continue
         if col_AC_results[i] == "APLICAR":
             continue
         if col_Y_results[i] == "SIN":
